@@ -401,3 +401,112 @@ def test_empty_file_is_named_empty(fake, tmp_path):
     with pytest.raises(OcrError, match="file is empty") as e:
         Client().quote(str(p), "p@1")
     assert e.value.code == "bad_input" and fake.log == []
+
+
+@pytest.mark.parametrize("status,code", [(502, "bad_gateway"), (504, "gateway_timeout")])
+def test_502_and_504_are_retried_like_503(fake, status, code):
+    """The production answered 502 while the service restarted (13.11.2026)."""
+    fake.scripted[("GET", "/v1/jobs/j1")] = [err(status, code), (200, {}, {"state": "running"})]
+    assert Client().status("j1")["state"] == "running" and len(fake.log) == 2
+    fake.log.clear()
+    fake.scripted[("GET", "/v1/jobs/j1")] = [err(status, code)]
+    with pytest.raises(OcrError) as e:
+        Client().status("j1")
+    assert e.value.code == code and len(fake.log) == 6
+
+
+def test_upload_cut_by_the_service_is_retried_like_429_with_the_same_idempotency_key(fake, doc):
+    """Measured 13.11.2026: beyond 2 uploads at once the service cuts the upload instead of answering 429."""
+    fake.scripted[("POST", "/v1/jobs")] = [(0, {}, b""), (0, {}, b""), (202, {}, {"job_id": "j2"})]
+    assert Client().submit(doc, "p@1")["job_id"] == "j2"
+    assert len(fake.log) == 3 and len({c["idem"] for c in fake.log}) == 1
+
+
+@pytest.mark.parametrize("reason", [ConnectionResetError(10054, "reset"), ConnectionAbortedError(10053, "aborted"), BrokenPipeError("pipe")])
+def test_cut_while_sending_is_retried_five_times_and_says_what_it_is(monkeypatch, doc, reason):
+    """urllib wraps a cut during the upload in URLError: that is not 'no connection' (2 tries) but 'busy' (5 retries)."""
+    import urllib.error
+    attempts = []
+
+    def cut(*args, **kwargs):
+        attempts.append(1)
+        raise urllib.error.URLError(reason)
+    monkeypatch.setattr(client_module._OPENER, "open", cut)
+    monkeypatch.setattr(client_module, "BACKOFF_BASE_S", 0)
+    with pytest.raises(OcrError, match="cut the connection") as e:
+        Client(api_key="ocr_secretkey", base_url="http://127.0.0.1:1").quote(doc, "p@1")
+    assert e.value.code == "network" and len(attempts) == 6 and "ocr_secretkey" not in str(e.value)
+
+
+def test_unknown_pipeline_error_shows_the_problem_once(fake, doc):
+    problem = "Unknown pipeline. Use name@version, one of: a@1, b@1."
+    fake.scripted[("POST", "/v1/jobs")] = [(400, {}, {"error": {"code": "invalid_request", "message": problem, "details": [problem]}})]
+    with pytest.raises(OcrError) as e:
+        Client().submit(doc, "x@1")
+    assert str(e.value).count("Unknown pipeline") == 1 and "details" not in str(e.value) and "{" not in str(e.value)
+
+
+def test_details_not_in_the_message_and_capability_lists_are_still_shown(fake, doc):
+    fake.scripted[("POST", "/v1/jobs")] = [(400, {}, {"error": {"code": "invalid_request", "message": "bad", "details": ["other"]}})]
+    with pytest.raises(OcrError, match="other"):
+        Client().submit(doc, "x@1")
+    fake.scripted[("POST", "/v1/jobs")] = [(422, {}, {"error": {"code": "capability_missing", "message": "m", "pipelines": ["a@1"]}})]
+    with pytest.raises(OcrError, match="a@1"):
+        Client().submit(doc, "x@1")
+
+
+BIG_DOC = b"%PDF-1.4 " + b"x" * (200 * 1024)  # beyond what the proxy discards after an early answer (256 KiB with headers)
+
+
+@pytest.fixture
+def big_doc(tmp_path):
+    p = tmp_path / "big.pdf"
+    p.write_bytes(BIG_DOC)
+    return str(p)
+
+
+@pytest.fixture
+def reset_on_upload(monkeypatch):
+    """What a client sees when the service answers early and closes while the upload is still going out: the first request
+    with a body fails while sending (Windows 10053), the answer is lost. Every other request really goes to the fake."""
+    import urllib.error
+    real, state = client_module._OPENER.open, {"cut": 0}
+
+    def open_(req, *args, **kwargs):
+        if req.data and len(req.data) > 1000 and not state["cut"]:
+            state["cut"] = 1
+            raise urllib.error.URLError(ConnectionAbortedError(10053, "aborted"))
+        return real(req, *args, **kwargs)
+    monkeypatch.setattr(client_module._OPENER, "open", open_)
+
+
+def test_big_upload_cut_after_a_refusal_shows_the_refusal_not_overload(fake, big_doc, reset_on_upload):
+    """13.11.2026 (LangChain test): a wrong key or pipeline with a 700 KB file came back after 33 s as 'cut 6 times, more than
+    2 uploads?' because the answer was lost in the reset. The client asks with an empty body and raises that answer at once."""
+    fake.scripted[("POST", "/v1/jobs")] = [err(400, "invalid_request", "Unknown pipeline.")]
+    with pytest.raises(OcrError, match="Unknown pipeline") as e:
+        Client().submit(big_doc, "foo@1")
+    assert e.value.code == "invalid_request" and len(fake.log) == 1 and fake.log[0]["body"] == b""
+    assert "ocr_testkey" not in str(e.value)
+
+
+def test_big_upload_cut_while_key_and_pipeline_are_fine_is_retried_with_the_same_idempotency_key(fake, big_doc, reset_on_upload):
+    fake.scripted[("POST", "/v1/jobs")] = [err(400, "empty_document", "document is empty"), (202, {}, {"job_id": "j3"})]
+    assert Client().submit(big_doc, "p@1")["job_id"] == "j3"
+    assert [c["body"] == b"" for c in fake.log] == [True, False] and fake.log[0]["idem"] is None and fake.log[1]["idem"]
+
+
+def test_big_upload_cut_with_a_locked_out_key_raises_locked_out(fake, big_doc, reset_on_upload):
+    fake.scripted[("POST", "/v1/jobs")] = [err(429, "locked_out", "locked", {"Retry-After": "705"})]
+    with pytest.raises(OcrError, match="locked_out") as e:
+        Client().submit(big_doc, "p@1")
+    assert e.value.http_status == 429 and len(fake.log) == 1
+
+
+def test_split_pages_text_and_markdown():
+    from ocr_software import split_pages
+    assert split_pages("a\nb\n\fc\n\f\nd\n") == [(1, "a\nb\n"), (2, "c\n"), (3, "\nd\n")]
+    assert split_pages("", "text") == [(1, "")]
+    md = "## Page 1\n\nfirst\n\n## Page 2\n\n## Page 7\n\nnot a page\n\n## Page 3\n\nlast\n"
+    assert split_pages(md, "md") == [(1, "first\n"), (2, "## Page 7\n\nnot a page\n"), (3, "last\n")]
+    assert split_pages("no headings", "md") == [(1, "no headings")]

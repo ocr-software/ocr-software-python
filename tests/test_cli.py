@@ -54,9 +54,19 @@ def test_pdf_needs_output_file_and_sends_original(fake, doc, tmp_path, capsysbin
     assert target.read_bytes() == b"%PDF-out" and fake.log[-1]["body"] == PDF
 
 
-def test_pipeline_is_required(fake, doc, capsysbinary):
+def test_without_pipeline_the_default_is_used_and_named_on_stderr(fake, doc, capsysbinary):
+    fake.scripted[("GET", "/v1/catalog")] = [(200, {}, CATALOG)]
+    job_flow(fake, result=b"hello")
+    code, out, errtext = run([doc], capsysbinary)
+    assert code == 0 and out == b"hello"  # stdout stays the result
+    assert "using a@1" in errtext and "fastest and cheapest" in errtext
+    assert [c for c in fake.log if c["method"] == "POST"][0]["query"].count("pipeline=a@1") == 1
+
+
+def test_without_pipeline_and_nothing_available_fails_clearly_and_sends_nothing(fake, doc, capsysbinary):
+    fake.scripted[("GET", "/v1/catalog")] = [(200, {}, {"pipelines": [{"pipeline": "b@1", "available": False, "factor": 1}]})]
     code, _, errtext = run([doc], capsysbinary)
-    assert code == 2 and "--pipeline" in errtext and fake.log == []
+    assert code == 1 and "no pipeline is available" in errtext and all(c["method"] == "GET" for c in fake.log)
 
 
 def test_output_must_not_be_the_input(fake, doc, capsysbinary):
@@ -96,6 +106,13 @@ def test_unknown_pipeline_exit_1(fake, doc, capsysbinary):
     assert run([doc, "--pipeline", "nope@1"], capsysbinary)[0] == 1
 
 
+def test_unknown_pipeline_message_appears_once_and_without_raw_json(fake, doc, capsysbinary):
+    problem = "Unknown pipeline. Use name@version, one of: a@1."
+    fake.scripted[("POST", "/v1/jobs")] = [(400, {}, {"error": {"code": "invalid_request", "message": problem, "details": [problem]}})]
+    code, _, errtext = run([doc, "--pipeline", "nope@1"], capsysbinary)
+    assert code == 1 and errtext.count("Unknown pipeline") == 1 and "{" not in errtext
+
+
 def test_no_key_exit_2(fake, doc, monkeypatch, capsysbinary):
     monkeypatch.delenv("OCR_SOFTWARE_API_KEY")
     code, _, errtext = run([doc, "--pipeline", "p@1"], capsysbinary)
@@ -125,6 +142,14 @@ def test_network_error_exit_1(doc, refused, monkeypatch, capsysbinary):
     assert code == 1 and "cannot connect" in errtext
 
 
+def test_unreachable_address_is_exit_1_a_malformed_one_is_exit_2(doc, refused, monkeypatch, capsysbinary):
+    """A typo and an outage look the same from here, so a script may retry exit 1; only a malformed address is a wrong call."""
+    monkeypatch.setenv("OCR_SOFTWARE_API_KEY", "ocr_k")
+    assert run([doc, "--pipeline", "p@1", "--base-url", "http://nohost.invalid"], capsysbinary)[0] == 1
+    assert len(refused) == 3  # 1 try and 2 retries, then it names the address
+    assert run([doc, "--pipeline", "p@1", "--base-url", "nohost.invalid"], capsysbinary)[0] == 2
+
+
 def test_base_url_flag_beats_environment(fake, doc, monkeypatch, capsysbinary):
     job_flow(fake, result=b"ok")
     service = os.environ["OCR_SOFTWARE_BASE_URL"]
@@ -134,13 +159,39 @@ def test_base_url_flag_beats_environment(fake, doc, monkeypatch, capsysbinary):
     assert code == 2 and "http" in errtext
 
 
-def test_list_pipelines_shows_only_available_and_needs_no_key(fake, monkeypatch, capsys):
+CATALOG = {"pipelines": [
+    {"pipeline": "a@1", "description": "fast", "available": True, "factor": 1, "level": "word", "features": ["word_boxes"],
+     "switch": [{"when": "hard_pages", "pipeline": "c@1"}]},
+    {"pipeline": "b@1", "description": "broken", "available": False, "factor": 0.5},
+    {"pipeline": "c@1", "description": "slow", "available": True, "factor": 4, "level": "word", "autoregressive": True}]}
+
+
+def test_list_pipelines_shows_only_available_with_price_and_default_and_needs_no_key(fake, monkeypatch, capsys):
     monkeypatch.delenv("OCR_SOFTWARE_API_KEY")
-    fake.scripted[("GET", "/v1/catalog")] = [(200, {}, {"pipelines": [
-        {"pipeline": "a@1", "description": "fast", "available": True},
-        {"pipeline": "b@1", "description": "broken", "available": False}]})]
+    fake.scripted[("GET", "/v1/catalog")] = [(200, {}, CATALOG)]
     assert cli.main(["--list-pipelines"]) == 0
-    assert capsys.readouterr().out == "a@1\tfast\n" and fake.log[0]["auth"] is None
+    out = capsys.readouterr()
+    assert out.out.splitlines() == [
+        "a@1	word boxes; price EUR 0.001 per page; the default (fastest and cheapest); for hard pages (poor scans, doubtful words) use c@1",
+        "c@1	word boxes, slower; price EUR 0.004 per page"]
+    assert "the default is a@1" in out.err and fake.log[0]["auth"] is None
+
+
+def test_dry_run_without_pipeline_names_the_default_in_the_sentence(fake, doc, capsys):
+    fake.scripted[("GET", "/v1/catalog")] = [(200, {}, CATALOG)]
+    fake.scripted[("POST", "/v1/jobs")] = [(200, {}, {"dry_run": True, "pages": 1, "price_per_page_millicents": 100,
+                                                      "price_millicents": 100, "max_charge_millicents": 0, "pages_covered": 1})]
+    assert cli.main([doc, "--dry-run"]) == 0
+    assert capsys.readouterr().out.startswith("1 page with a@1:")
+
+
+def test_dry_run_prints_the_price_in_euros_and_runs_nothing(fake, doc, capsys):
+    fake.scripted[("POST", "/v1/jobs")] = [(200, {}, {"dry_run": True, "pages": 3, "price_per_page_millicents": 100,
+                                                      "price_millicents": 300, "max_charge_millicents": 0, "pages_covered": 3})]
+    assert cli.main([doc, "--pipeline", "a@1", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert out.startswith("3 pages with a@1: you pay EUR 0.00 today. List price EUR 0.003 in total (EUR 0.001 per page)")
+    assert "fair-usage" in out and "millicents" not in out and "dry_run=1" in fake.log[0]["query"] and len(fake.log) == 1
 
 
 def test_python_dash_m_end_to_end(fake, doc, tmp_path):

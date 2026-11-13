@@ -11,6 +11,7 @@ import os
 import sys
 
 from . import __version__
+from .advice import default_pipeline, price_sentence, summary
 from .client import DEFAULT_WAIT_TIMEOUT_S, FORMATS, Client, OcrError, PagesUnread
 
 EXIT_ERROR, EXIT_USAGE, EXIT_UNREAD, EXIT_TIMEOUT = 1, 2, 3, 4
@@ -21,13 +22,14 @@ def _parser():
     p = argparse.ArgumentParser(prog="ocr-software", description="Read a PDF, PNG, JPEG or TIFF with the ocr-software.com API.")
     p.add_argument("input", nargs="?", help="the document")
     p.add_argument("-o", "--output", help="output file; without it the result goes to stdout (not for pdf)")
-    p.add_argument("--pipeline", help="name@version, required; --list-pipelines shows the choices")
+    p.add_argument("--pipeline", help="name@version (default: the fastest and cheapest available one, named on stderr); --list-pipelines shows the choices")
     p.add_argument("--format", default="text", choices=FORMATS, help="default text")
     p.add_argument("--dpi", type=int, choices=(150, 200, 300), help="render resolution of a PDF (default 150)")
-    p.add_argument("--job-budget", type=int, help="millicents; only if the operator set prices")
+    p.add_argument("--job-budget", type=int, help="cap in millicents (100,000 = 1 EUR; one page of the cheapest pipeline = 100). Where billing is off it is ignored")
+    p.add_argument("--dry-run", action="store_true", help="show the page count and the price in euros, run nothing, cost nothing")
     p.add_argument("--timeout", type=int, default=DEFAULT_WAIT_TIMEOUT_S, help="seconds to wait for the job (default %(default)s)")
     p.add_argument("--base-url", help="address of the service (default OCR_SOFTWARE_BASE_URL, else the hosted API)")
-    p.add_argument("--list-pipelines", action="store_true", help="print the available pipelines and exit")
+    p.add_argument("--list-pipelines", action="store_true", help="print the available pipelines (name, tab, what it delivers and costs) and the default one, then exit")
     p.add_argument("--version", action="version", version="ocr-software " + __version__)
     return p
 
@@ -69,19 +71,33 @@ def main(argv=None):
     try:
         client = Client(base_url=args.base_url)
         if args.list_pipelines:
-            for p in client.catalog().get("pipelines", []):
+            pipelines = client.catalog().get("pipelines", [])
+            default = default_pipeline(pipelines)
+            for p in pipelines:
                 if p.get("available"):
-                    print("%s\t%s" % (p.get("pipeline"), p.get("description", "")))
+                    print("%s	%s" % (p.get("pipeline"), summary(p, default)))
+            if default:
+                print("ocr-software: without --pipeline the default is %s (the fastest and cheapest available one)" % default, file=sys.stderr)
             return 0
-        if not args.input or not args.pipeline:
-            parser.error("IN and --pipeline are required (--list-pipelines shows the pipelines)")
+        if not args.input:
+            parser.error("IN is required (--list-pipelines shows the pipelines)")
         if args.format == "pdf" and not args.output:
             parser.error("--format pdf needs -o OUT (a PDF is not written to the terminal)")
         if args.output and _same_file(args.input, args.output):
             parser.error("OUT is the input file; it would be overwritten")
         if args.output and not os.path.isdir(os.path.dirname(os.path.abspath(args.output))):
             parser.error("folder of %s does not exist; nothing was sent" % args.output)  # before the job, not after it
-        data = client.ocr(args.input, args.pipeline, args.format, timeout=args.timeout, dpi=args.dpi, job_budget=args.job_budget)
+        pipeline = args.pipeline
+        if not pipeline:  # the default is named, never silent (ziel.md: fastest and cheapest available; stdout stays the result)
+            pipeline = client.default_pipeline()
+            print("ocr-software: no --pipeline given, using %s (the fastest and cheapest available one; --list-pipelines shows the others)" % pipeline,
+                  file=sys.stderr)
+        if args.dry_run:
+            q = client.quote(args.input, pipeline, args.dpi)
+            q.setdefault("pipeline", pipeline)
+            print(price_sentence(q))
+            return 0
+        data = client.ocr(args.input, pipeline, args.format, timeout=args.timeout, dpi=args.dpi, job_budget=args.job_budget)
         _emit(data, args.output)
         return 0
     except PagesUnread as e:

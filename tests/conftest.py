@@ -17,7 +17,7 @@ ENV_NAMES = ("OCR_KEY", "OCR_BASE_URL", "OCR_ALLOWED_DIR", "OCR_SOFTWARE_ALLOWED
 
 
 class Fake(BaseHTTPRequestHandler):
-    """Records every request; scripted[(method, path)] is a list of (status, headers, body) used in order, the last one repeats."""
+    """Records every request; scripted[(method, path)] is a list of (status, headers, body) used in order, the last one repeats; status 0 cuts the connection."""
     log = []
     scripted = {}
 
@@ -29,6 +29,9 @@ class Fake(BaseHTTPRequestHandler):
                          "auth": self.headers.get("Authorization"), "idem": self.headers.get("Idempotency-Key"), "body": body})
         queue = Fake.scripted.get((self.command, path), [])
         status, headers, payload = queue.pop(0) if len(queue) > 1 else queue[0]
+        if status == 0:  # the service cuts the connection without any answer
+            self.close_connection = True
+            return
         raw = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
         self.send_response(status)
         for k, v in headers.items():

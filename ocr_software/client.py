@@ -17,12 +17,16 @@ import urllib.parse
 import urllib.request
 import uuid
 
+from .advice import default_pipeline
+
 DEFAULT_BASE_URL = "https://api.ocr-software.com"
-MAX_RETRIES = 5  # retry rules of agents.md: 429, 503, 500 and network errors, waits 1, 2, 4, 8, 16 s
+MAX_RETRIES = 5  # retry rules of agents.md: 429, 500, 502, 503, 504 and network errors, waits 1, 2, 4, 8, 16 s
+RETRY_STATUS = (429, 500, 502, 503, 504)  # 502/504: proxy in front of a restarting service (seen 13.11.2026)
 BACKOFF_BASE_S = 1.0  # tests set it to 0
 RETRY_AFTER_LIMIT_S = 60  # longer: stop (locked_out has 900)
 HTTP_TIMEOUT_S = 90  # a status call waits up to 60 s on the server
 CONNECT_TIMEOUT_S = 10  # a wrong or unreachable address must fail fast, not after the read timeout
+PROBE_MIN_BODY = 64 * 1024  # an upload cut after this much may have been refused early (wrong key, pipeline, address): ask
 CONNECT_RETRIES = 2  # no connection at all (refused, unknown host, no route): 2 retries, not 5
 WAIT_SLICE_S = 30  # one long poll of wait()
 DEFAULT_WAIT_TIMEOUT_S = 3600
@@ -92,6 +96,9 @@ class _HTTPSHandler(urllib.request.HTTPSHandler):
 _OPENER = urllib.request.build_opener(_NoRedirect, _HTTPHandler, _HTTPSHandler)
 
 
+_CUT_OFF = (ConnectionResetError, ConnectionAbortedError, BrokenPipeError)  # Windows 10053/10054, Linux EPIPE/ECONNRESET
+
+
 def _int(text):
     try:
         return int(text)
@@ -105,8 +112,51 @@ def _error_of(e):
         err = json.loads(e.read(65536))["error"]  # bounded: an error body is short
     except (ValueError, KeyError, TypeError, OSError, http.client.HTTPException):
         return "http_error", str(e.reason)
+    message = err.get("message", "")
     extra = {k: err[k] for k in ("details", "missing", "pipelines") if k in err}
-    return err.get("code", "http_error"), err.get("message", "") + (" " + json.dumps(extra) if extra else "")
+    details = extra.get("details")
+    if isinstance(details, list) and all(isinstance(d, str) and d in message for d in details):
+        del extra["details"]  # the service joins the details into the message: show them once
+    return err.get("code", "http_error"), message + (" " + json.dumps(extra) if extra else "")
+
+
+def _refusal(url, head):
+    """The real answer to an upload that was cut. The service (behind its proxy) answers a wrong key, pipeline or address
+    before it reads the body and closes; a client that is still sending gets a reset and never sees the answer (Windows
+    10053/10054, found 13.11.2026). The same request with an empty body is refused for the same reason at once, and
+    otherwise answers empty_document: then the key and the pipeline are fine and the cut was load. Returns an OcrError
+    to raise, or None if the cut is to be retried."""
+    probe_head = {k: v for k, v in head.items() if k != "Idempotency-Key"}  # the probe is not the upload
+    try:
+        with _OPENER.open(urllib.request.Request(url, data=b"", method="POST", headers=probe_head), timeout=CONNECT_TIMEOUT_S):
+            return None
+    except urllib.error.HTTPError as e:
+        code, message = _error_of(e)
+        if code == "empty_document" or (e.code in RETRY_STATUS and code != "locked_out"):
+            return None
+        return OcrError("%d %s: %s" % (e.code, code, message), code, e.code)
+    except (OSError, http.client.HTTPException):  # no answer to the probe either: the normal retry rules decide
+        return None
+
+
+_PAGE_HEADING = re.compile(r"^## Page (\d+)\n\n", re.M)
+
+
+def split_pages(text, format="text"):
+    """The pages of a result as [(number, text)]. format "text": pages are separated by a form feed (as pdftotext does), "md":
+    every page starts with the heading "## Page N" (the heading is not part of the page text). A result that does not look
+    like either format is one page, never an error."""
+    if format == "md":
+        starts, want = [], 1
+        for m in _PAGE_HEADING.finditer(text):  # a heading the model wrote inside a page does not count: numbers run 1, 2, 3 ...
+            if int(m.group(1)) == want:
+                starts.append(m)
+                want += 1
+        if starts:
+            ends = [m.start() for m in starts[1:]] + [len(text)]
+            return [(i + 1, text[m.end():end].rstrip("\n") + "\n") for i, (m, end) in enumerate(zip(starts, ends))]
+        return [(1, text)]
+    return [(i + 1, page) for i, page in enumerate(text.split("\f"))]
 
 
 def check_job_id(job_id):
@@ -187,6 +237,7 @@ class Client:
             if not KEY_CHARS.fullmatch(self._key):  # fullmatch: "$" would let a trailing newline pass  # a bad character would make http.client echo the key
                 raise OcrError("API key contains characters that are not allowed in a header", "no_key")
             head["Authorization"] = "Bearer " + self._key
+        probed = False
         for attempt in range(MAX_RETRIES + 1):
             req = urllib.request.Request(url, data=body, method=method, headers=head)
             try:
@@ -200,13 +251,23 @@ class Client:
                 retry_after = _int(e.headers.get("Retry-After"))
                 if retry_after > RETRY_AFTER_LIMIT_S:
                     raise OcrError("%d %s: %s (Retry-After %d s: not retried, ask the human)" % (e.code, code, message, retry_after), code, e.code)
-                if e.code not in (429, 500, 503) or attempt == MAX_RETRIES:
+                if e.code not in RETRY_STATUS or attempt == MAX_RETRIES:
                     raise OcrError("%d %s: %s" % (e.code, code, message), code, e.code)
                 delay = max(retry_after, BACKOFF_BASE_S * 2 ** attempt)
-            except urllib.error.URLError as e:  # urllib raises URLError only if the request could not be sent: no connection
-                if attempt >= CONNECT_RETRIES:
-                    raise OcrError("cannot connect to %s: %s (check OCR_SOFTWARE_BASE_URL or --base-url)" % (self.base_url, e.reason), "network")
-                delay = BACKOFF_BASE_S * 2 ** attempt
+            except urllib.error.URLError as e:  # urllib raises URLError only if the request could not be sent
+                if isinstance(e.reason, _CUT_OFF) and body and len(body) >= PROBE_MIN_BODY and not probed:
+                    probed = True
+                    refusal = _refusal(url, head)
+                    if refusal:
+                        raise refusal
+                if isinstance(e.reason, _CUT_OFF):  # connected, then cut: the service drops an upload beyond 2 per key instead of 429
+                    if attempt == MAX_RETRIES:
+                        raise OcrError("the service cut the connection %d times (more than 2 uploads at once with this key?): %s" % (attempt + 1, e.reason), "network")
+                    delay = BACKOFF_BASE_S * 2 ** attempt
+                elif attempt >= CONNECT_RETRIES:
+                    raise OcrError("cannot connect to %s: %s (check base_url, OCR_SOFTWARE_BASE_URL or --base-url)" % (self.base_url, e.reason), "network")
+                else:
+                    delay = BACKOFF_BASE_S * 2 ** attempt
             except (OSError, http.client.HTTPException) as e:  # timeouts, timeouts (socket.timeout is no TimeoutError before 3.10), resets, cut bodies
                 if attempt == MAX_RETRIES:
                     raise OcrError("network error: %s" % e, "network")
@@ -227,8 +288,17 @@ class Client:
         """What the service offers (no key needed): pipelines, formats, features."""
         return self._json("GET", "/v1/catalog", key_needed=False)
 
+    def default_pipeline(self):
+        """name@version used when the caller names none: the fastest and cheapest available one (advice.default_pipeline). Say
+        to the user which one it was."""
+        name = default_pipeline(self.catalog().get("pipelines", []))
+        if not name:
+            raise OcrError("no pipeline is available right now: try again later or see %s/v1/catalog" % self.base_url, "unavailable")
+        return name
+
     def quote(self, path, pipeline, dpi=None):
-        """Dry run: nothing runs, nothing is billed. Returns the page count and warnings."""
+        """Dry run: nothing runs, nothing is billed. Returns the page count, price_per_page_millicents, price_millicents (100,000
+        millicents = 1 EUR) and warnings. ocr_software.advice.price_sentence(q) turns it into one sentence in euros."""
         body = read_document(path, self.allowed_dir)
         return self._json("POST", "/v1/jobs", query={"pipeline": pipeline, "dry_run": 1, "dpi": dpi}, body=body)
 
