@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools==82.0.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ocr-software"
+version = "0.1.0"
+description = "Client and command line for the ocr-software.com OCR API: text, word boxes, layout, searchable PDF."
+readme = {file = "INSTALL.txt", content-type = "text/plain"}
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.9"
+dependencies = []
+keywords = ["ocr", "pdf", "searchable-pdf", "hocr", "markdown", "document-ai"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Topic :: Scientific/Engineering :: Image Recognition",
+]
+
+[project.optional-dependencies]
+test = ["pytest==9.0.2"]
+
+[project.urls]
+Homepage = "https://ocr-software.com/"
+Repository = "https://github.com/ocr-software/ocr-software-python"
+
+[project.scripts]
+ocr-software = "ocr_software.cli:main"
+
+[tool.setuptools]
+packages = ["ocr_software"]
