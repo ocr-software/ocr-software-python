@@ -16,6 +16,8 @@ def test_readme_file_exists_and_no_runtime_dependencies():
     pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
     assert (ROOT / "INSTALL.txt").is_file() and 'file = "INSTALL.txt"' in pyproject
     assert "dependencies = []" in pyproject  # standard library only
+    # 13.11.2026: as text/plain PyPI showed one fixed-width block whose long lines ran off the page
+    assert 'content-type = "text/markdown"' in pyproject
 
 
 def test_readme_that_pypi_shows_has_no_draft_note():

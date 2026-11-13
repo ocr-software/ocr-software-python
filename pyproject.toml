@@ -4,9 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ocr-software"
-version = "0.1.0"
+version = "0.1.1"
 description = "Client and command line for the ocr-software.com OCR API: text, word boxes, layout, searchable PDF."
-readme = {file = "INSTALL.txt", content-type = "text/plain"}
+readme = {file = "INSTALL.txt", content-type = "text/markdown"}
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.9"
