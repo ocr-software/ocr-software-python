@@ -11,7 +11,7 @@ MILLICENTS_PER_FACTOR = 100  # factor 1 = the base price per page
 FAIR_USE = "Free use has limits (https://ocr-software.com/legal/fair-usage/); for more volume write to info@ocr-software.com."
 SWITCH_HINTS = {
     "hard_pages": "for hard pages (poor scans, doubtful words) use %s",
-    "turned_pages": "for turned pages use %s",
+    "turned_pages": "pages that arrive turned (sideways or upside down) are read poorly here; %s checks the page orientation and turns them upright",
     "no_tables": "without tables %s is cheaper",
     "clean_bulk": "for clean bulk text %s is cheaper",
 }

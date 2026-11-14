@@ -277,3 +277,9 @@ def test_a_plain_real_job_stays_one_upload(fake, doc, capsysbinary):
     job_flow(fake)
     run([doc, "--pipeline", "a@1"], capsysbinary)
     assert sum(1 for c in fake.log if c["method"] == "POST" and "/result" not in c["path"]) == 1
+
+
+def test_turned_pages_hint_names_the_reason_not_only_the_pipeline():
+    from ocr_software import advice
+    line = advice.summary({"pipeline": "a@1", "switch": [{"when": "turned_pages", "pipeline": "t@1"}]})
+    assert "arrive turned" in line and "turns them upright" in line and "t@1" in line
