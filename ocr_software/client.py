@@ -1,6 +1,6 @@
 """Client for the ocr-software.com API (standard library only, Python 3.9 or newer).
 
-Settings: OCR_SOFTWARE_API_KEY (or OCR_KEY, the name used in the API docs), OCR_SOFTWARE_BASE_URL (or OCR_BASE_URL),
+Settings (the OCR_SOFTWARE_ name wins if both are set): OCR_SOFTWARE_API_KEY (or OCR_KEY, the name used in the API docs), OCR_SOFTWARE_BASE_URL (or OCR_BASE_URL),
 OCR_SOFTWARE_ALLOWED_DIR (optional). The key is never printed, never in an error message, never in a log.
 Spec of every path, field and error code: <base>/openapi.json.
 """
@@ -233,7 +233,7 @@ class Client:
         head = dict(headers or {})
         if key_needed:
             if not self._key:
-                raise OcrError("API key missing: set OCR_SOFTWARE_API_KEY (the key starts with ocr_)", "no_key")
+                raise OcrError("API key missing: set OCR_SOFTWARE_API_KEY or OCR_KEY (the key starts with ocr_)", "no_key")
             if not KEY_CHARS.fullmatch(self._key):  # fullmatch: "$" would let a trailing newline pass  # a bad character would make http.client echo the key
                 raise OcrError("API key contains characters that are not allowed in a header", "no_key")
             head["Authorization"] = "Bearer " + self._key
@@ -345,13 +345,17 @@ class Client:
             data, _ = self._call("GET", "/v1/jobs/%s/result" % job_id, query={"format": format})
         return data
 
-    def ocr(self, path, pipeline, format="text", timeout=DEFAULT_WAIT_TIMEOUT_S, **options):
-        """Submit, wait, fetch: the result bytes. options go to submit (dpi, client_ref, job_budget, formats, features).
-        Raises PagesUnread (with .data, the result anyway) if a page failed or was not run: never silent."""
+    def ocr(self, path, pipeline, format="text", timeout=DEFAULT_WAIT_TIMEOUT_S, on_accepted=None, **options):
+        """Submit, wait, fetch: the result as bytes, also for text, md, json and hocr (use .decode("utf-8") for a string). options go to submit (dpi, client_ref, job_budget, formats, features).
+        Raises PagesUnread (with .data, the result anyway) if a page failed or was not run: never silent.
+        on_accepted(answer) is called with the answer to the submit; its "warnings" (absent from an older service) say why fewer pages run."""
         if format not in FORMATS:
             raise OcrError("format must be one of %s" % ", ".join(FORMATS), "bad_input")
         source = read_document(path, self.allowed_dir)  # read once: PDF output needs the same bytes again
-        job_id = self._submit(source, pipeline, **options).get("job_id")
+        accepted = self._submit(source, pipeline, **options)
+        if on_accepted:
+            on_accepted(accepted)
+        job_id = accepted.get("job_id")
         if not job_id:
             raise OcrError("the answer of %s has no job_id: check OCR_SOFTWARE_BASE_URL" % self.base_url, "bad_response")
         done = self.wait(job_id, timeout)

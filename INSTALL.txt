@@ -23,11 +23,11 @@ Environment variables; the command line flag wins.
 
 | Variable | Meaning |
 |---|---|
-| `OCR_SOFTWARE_API_KEY` | API key (starts with `ocr_`). `OCR_KEY` is read too, it is the name used in the API docs. |
+| `OCR_SOFTWARE_API_KEY` | API key (starts with `ocr_`). `OCR_KEY` is read too, it is the name used in the API docs; if both are set, `OCR_SOFTWARE_API_KEY` wins. |
 | `OCR_SOFTWARE_BASE_URL` | Default `https://api.ocr-software.com`; own server e.g. `http://127.0.0.1:8080` (also `--base-url`). `OCR_BASE_URL` is read too. |
 | `OCR_SOFTWARE_ALLOWED_DIR` | Optional: read documents only from below this folder (symlinks and `..` do not escape). |
 
-The key is never printed and never part of an error message. Without `--pipeline` the default is used: the fastest and cheapest available pipeline (no previews). It is named on stderr; `--list-pipelines` marks it. In Python: `client.ocr(path, client.default_pipeline())`.
+The key is never printed and never part of an error message. Without `--pipeline` the default is used: the fastest and cheapest available pipeline (no previews). It is named on stderr (`-q` silences that line for bulk runs; `-o NUL` or `-o /dev/null` discards the result); `--list-pipelines` marks it. Warnings of the service (`dpi_ignored`, `job_budget`, `free_limit`, `balance_too_low`) are printed as `warning CODE: text` lines on stderr by `--dry-run` and before a job that uses `--dpi` or `--job-budget` (that job asks once with a dry run first). In Python: `client.ocr(path, client.default_pipeline())`.
 
 ## Command line
 
@@ -49,7 +49,7 @@ Options:
 - `--dpi 150|200|300` (PDF render resolution)
 - `--timeout SECONDS` (wait for the job, default 3600)
 - `--job-budget MILLICENTS` (cap; ignored where billing is off)
-- `--dry-run`, `--version`
+- `-q`, `--dry-run`, `--version`
 
 Without `-o` the result goes to stdout as UTF-8 (not for pdf). With `-o` the file appears whole or not at all, an existing file is replaced, and the input file itself is refused as output.
 
@@ -68,7 +68,7 @@ Without `-o` the result goes to stdout as UTF-8 (not for pdf). With `-o` the fil
 ```python
 from ocr_software import Client, PagesUnread
 client = Client()                                    # key and address from the environment
-text = client.ocr("scan.pdf", "NAME@VERSION", "md")  # bytes; raises PagesUnread (with .data) if a page was not read
+text = client.ocr("scan.pdf", "NAME@VERSION", "md")  # bytes (text.decode("utf-8") for a string); raises PagesUnread (with .data) if a page was not read
 pdf = client.ocr("scan.pdf", "NAME@VERSION", "pdf")  # searchable PDF
 job = client.submit("scan.pdf", "NAME@VERSION")      # step by step: submit, wait, result
 client.wait(job["job_id"]); client.result(job["job_id"], "json")

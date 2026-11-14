@@ -11,7 +11,7 @@ import os
 import sys
 
 from . import __version__
-from .advice import default_pipeline, price_sentence, summary
+from .advice import default_pipeline, price_sentence, summary, warning_lines
 from .client import DEFAULT_WAIT_TIMEOUT_S, FORMATS, Client, OcrError, PagesUnread
 
 EXIT_ERROR, EXIT_USAGE, EXIT_UNREAD, EXIT_TIMEOUT = 1, 2, 3, 4
@@ -26,6 +26,7 @@ def _parser():
     p.add_argument("--format", default="text", choices=FORMATS, help="default text")
     p.add_argument("--dpi", type=int, choices=(150, 200, 300), help="render resolution of a PDF (default 150)")
     p.add_argument("--job-budget", type=int, help="cap in millicents (100,000 = 1 EUR; one page of the cheapest pipeline = 100). Where billing is off it is ignored")
+    p.add_argument("-q", "--quiet", action="store_true", help="do not name the default pipeline on stderr (for bulk runs); errors and warnings stay")
     p.add_argument("--dry-run", action="store_true", help="show the page count and the price in euros, run nothing, cost nothing")
     p.add_argument("--timeout", type=int, default=DEFAULT_WAIT_TIMEOUT_S, help="seconds to wait for the job (default %(default)s)")
     p.add_argument("--base-url", help="address of the service (default OCR_SOFTWARE_BASE_URL, else the hosted API)")
@@ -54,7 +55,19 @@ def _same_file(a, b):
         return False
 
 
+def _is_devnull(path):
+    # "-o NUL" on Windows, "-o /dev/null" everywhere (also typed on Windows from Git Bash, where no folder \dev exists)
+    return bool(path) and os.path.normcase(path) in (os.path.normcase(os.devnull), os.path.normcase("/dev/null"))
+
+
+def _print_warnings(answer):
+    for line in warning_lines(answer):  # an older service sends none: nothing to print
+        print("ocr-software: " + line, file=sys.stderr)
+
+
 def _emit(data, output):
+    if _is_devnull(output):
+        return  # discard: a .part file next to the null device cannot exist
     if output:
         _write(output, data)
     else:
@@ -83,21 +96,24 @@ def main(argv=None):
             parser.error("IN is required (--list-pipelines shows the pipelines)")
         if args.format == "pdf" and not args.output:
             parser.error("--format pdf needs -o OUT (a PDF is not written to the terminal)")
-        if args.output and _same_file(args.input, args.output):
+        if args.output and not _is_devnull(args.output) and _same_file(args.input, args.output):
             parser.error("OUT is the input file; it would be overwritten")
-        if args.output and not os.path.isdir(os.path.dirname(os.path.abspath(args.output))):
+        if args.output and not _is_devnull(args.output) and not os.path.isdir(os.path.dirname(os.path.abspath(args.output))):
             parser.error("folder of %s does not exist; nothing was sent" % args.output)  # before the job, not after it
         pipeline = args.pipeline
         if not pipeline:  # the default is named, never silent (ziel.md: fastest and cheapest available; stdout stays the result)
             pipeline = client.default_pipeline()
-            print("ocr-software: no --pipeline given, using %s (the fastest and cheapest available one; --list-pipelines shows the others)" % pipeline,
-                  file=sys.stderr)
+            if not args.quiet:
+                print("ocr-software: no --pipeline given, using %s (the fastest and cheapest available one; --list-pipelines shows the others)" % pipeline,
+                      file=sys.stderr)
         if args.dry_run:
             q = client.quote(args.input, pipeline, args.dpi)
             q.setdefault("pipeline", pipeline)
             print(price_sentence(q))
+            _print_warnings(q)
             return 0
-        data = client.ocr(args.input, pipeline, args.format, timeout=args.timeout, dpi=args.dpi, job_budget=args.job_budget)
+        data = client.ocr(args.input, pipeline, args.format, timeout=args.timeout, dpi=args.dpi, job_budget=args.job_budget,
+                          on_accepted=_print_warnings)  # the service names the warnings in its answer: no extra dry run
         _emit(data, args.output)
         return 0
     except PagesUnread as e:

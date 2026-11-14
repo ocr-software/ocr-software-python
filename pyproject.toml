@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ocr-software"
-version = "0.1.1"
+version = "0.1.2"
 description = "Client and command line for the ocr-software.com OCR API: text, word boxes, layout, searchable PDF."
 readme = {file = "INSTALL.txt", content-type = "text/markdown"}
 license = "MIT"
@@ -21,7 +21,7 @@ classifiers = [
 test = ["pytest==9.0.2"]
 
 [project.urls]
-Homepage = "https://ocr-software.com/"
+Homepage = "https://ocr-software.com/integrations/python/"
 Repository = "https://github.com/ocr-software/ocr-software-python"
 
 [project.scripts]

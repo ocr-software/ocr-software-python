@@ -510,3 +510,13 @@ def test_split_pages_text_and_markdown():
     md = "## Page 1\n\nfirst\n\n## Page 2\n\n## Page 7\n\nnot a page\n\n## Page 3\n\nlast\n"
     assert split_pages(md, "md") == [(1, "first\n"), (2, "## Page 7\n\nnot a page\n"), (3, "last\n")]
     assert split_pages("no headings", "md") == [(1, "no headings")]
+
+
+def test_both_names_set_the_ocr_software_name_wins_for_key_url_and_folder(monkeypatch):
+    for short, long_, bad, good in (("OCR_KEY", "OCR_SOFTWARE_API_KEY", "ocr_bogus", "ocr_good"),
+                                    ("OCR_BASE_URL", "OCR_SOFTWARE_BASE_URL", "http://bad:1", "http://good:1"),
+                                    ("OCR_ALLOWED_DIR", "OCR_SOFTWARE_ALLOWED_DIR", "/bad", "/good")):
+        monkeypatch.setenv(short, bad)
+        monkeypatch.setenv(long_, good)
+    c = Client()
+    assert (c._key, c.base_url, c.allowed_dir) == ("ocr_good", "http://good:1", "/good")

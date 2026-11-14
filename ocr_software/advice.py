@@ -43,6 +43,12 @@ def price_sentence(q, show_list_price=True):
     return text
 
 
+def warning_lines(q):
+    """One line per warning of a dry run (dpi_ignored, job_budget, free_limit, balance, balance_too_low), for stderr:
+    price_sentence says what it costs, these say why fewer pages run or why an option does nothing."""
+    return ["warning %s: %s" % (w.get("code", "?"), w.get("message", "")) for w in q.get("warnings") or []]
+
+
 def cost(p):
     """Price per page in millicents, comparable between pipelines: the catalog price, else factor * 100 (the catalog hides the
     price while billing is off, the factor stays)."""

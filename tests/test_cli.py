@@ -221,3 +221,59 @@ def test_ctrl_c_ends_without_a_stack_trace(fake, doc, monkeypatch, capsysbinary)
     monkeypatch.setattr(cli.Client, "ocr", interrupted)
     code, out, errtext = run([doc, "--pipeline", "p@1"], capsysbinary)
     assert code == 130 and out == b"" and "interrupted" in errtext and "Traceback" not in errtext
+
+
+def test_quiet_drops_the_default_pipeline_line_only(fake, doc, capsysbinary):
+    fake.scripted[("GET", "/v1/catalog")] = [(200, {}, {"pipelines": [{"pipeline": "p@1", "available": True, "price_per_page_millicents": 100}]})]
+    job_flow(fake, result=b"x")
+    code, _, errtext = run([doc, "-q"], capsysbinary)
+    assert code == 0 and errtext == ""
+    job_flow(fake, result=b"x")
+    code, _, errtext = run([doc], capsysbinary)
+    assert code == 0 and "no --pipeline given, using p@1" in errtext
+
+
+def test_output_to_the_null_device_is_accepted_and_discards(fake, doc, capsysbinary):
+    job_flow(fake, result=b"gone")
+    code, out, errtext = run([doc, "--pipeline", "p@1", "-o", os.devnull], capsysbinary)
+    assert (code, out, errtext) == (0, b"", "")
+
+
+@pytest.mark.parametrize("target", [os.devnull, "/dev/null"])
+def test_both_null_device_spellings_discard_on_every_system(fake, doc, capsysbinary, target):
+    job_flow(fake, result=b"gone")
+    code, out, errtext = run([doc, "--pipeline", "p@1", "-o", target], capsysbinary)
+    assert (code, out, errtext) == (0, b"", "")
+
+
+DPI_WARNING = {"code": "dpi_ignored", "message": "dpi applies to the pages of a PDF."}
+DRY_WITH_WARNING = {"dry_run": True, "pages": 1, "price_per_page_millicents": 100, "price_millicents": 100, "max_charge_millicents": 0,
+                    "pages_covered": 1, "warnings": [DPI_WARNING]}
+
+
+def test_dry_run_shows_every_warning_as_its_own_stderr_line(fake, doc, capsysbinary):
+    fake.scripted[("POST", "/v1/jobs")] = [(200, {}, dict(DRY_WITH_WARNING, warnings=[DPI_WARNING, {"code": "job_budget", "message": "covers 1 of 2"}]))]
+    code, out, errtext = run([doc, "--pipeline", "a@1", "--dry-run", "--dpi", "300"], capsysbinary)
+    assert code == 0 and b"1 page with a@1" in out
+    assert errtext.splitlines() == ["ocr-software: warning dpi_ignored: dpi applies to the pages of a PDF.",
+                                    "ocr-software: warning job_budget: covers 1 of 2"]
+
+
+def test_a_real_job_shows_the_warnings_of_the_answer_in_one_upload(fake, doc, capsysbinary):
+    job_flow(fake, result=b"text")
+    fake.scripted[("POST", "/v1/jobs")] = [(202, {}, {"job_id": "j1", "state": "running", "warnings": [DPI_WARNING]})]
+    code, out, errtext = run([doc, "--pipeline", "a@1", "--dpi", "300", "--job-budget", "1"], capsysbinary)
+    assert code == 0 and out == b"text" and errtext == "ocr-software: warning dpi_ignored: dpi applies to the pages of a PDF.\n"
+    posts = [c for c in fake.log if c["method"] == "POST" and "/result" not in c["path"]]
+    assert len(posts) == 1 and "dry_run" not in posts[0]["query"]
+
+
+def test_an_older_service_without_warnings_breaks_nothing(fake, doc, capsysbinary):
+    job_flow(fake, result=b"text")
+    assert run([doc, "--pipeline", "a@1", "--dpi", "300"], capsysbinary) == (0, b"text", "")
+
+
+def test_a_plain_real_job_stays_one_upload(fake, doc, capsysbinary):
+    job_flow(fake)
+    run([doc, "--pipeline", "a@1"], capsysbinary)
+    assert sum(1 for c in fake.log if c["method"] == "POST" and "/result" not in c["path"]) == 1
